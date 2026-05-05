@@ -1,0 +1,22 @@
+sudo systemctl status apache2    // apache staus
+
+sudo systemctl stop apache2      // stop apache
+sudo systemctl disable apache2
+
+sudo systemctl stop nginx       // stop nginx
+
+sudo systemctl daemon-reload    // restart service
+
+sudo systemctl restart ESP32_IAQ.service
+
+
+sudo iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 3000    //port rerouting
+
+sudo iptables -t nat -L                                                             // list rules - verify 
+
+
+sudo netstat -tulpn | grep LISTEN  //You should see an entry for Node.js or node listening on port 3000.
+
+
+
+https://chatgpt.com/share/6988bd14-832c-8006-978f-0f99e196c184

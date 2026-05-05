@@ -1,0 +1,25 @@
+AR checking written on:
+'D:\Documents\Arduino\ESP32\ESP32_BME690\ESP32_BME690\hardware\kicad\ESP32_BME690_AR-Check.txt'
+'action_menu_annular_check.py'
+version = 1.7.2
+Testing PCB for Annular Rings
+TH Pads >= 0.125 Vias >= 0.125
+PHD margin on PTH = 0
+
+VIAS that Pass = 89; Fails = 0
+AR PTH violation of 0.1 at XY 132.8,128.5
+AR PTH violation of 0.1 at XY 132.4,129.21
+AR PTH violation of 0.1 at XY 131.6,129.21
+AR PTH violation of 0.1 at XY 131.2,128.5
+AR PTH violation of 0.1 at XY 130.8,129.21
+AR PTH violation of 0.1 at XY 130.4,128.5
+AR PTH violation of 0.1 at XY 129.6,128.5
+AR PTH violation of 0.1 at XY 129.2,129.21
+AR PTH violation of 0.1 at XY 128.8,128.5
+AR PTH violation of 0.1 at XY 128.4,129.21
+AR PTH violation of 0.1 at XY 127.6,129.21
+AR PTH violation of 0.1 at XY 127.2,128.5
+AR PTH violation of 0.1 at XY 132.0,128.5
+AR PTH violation of 0.1 at XY 128.0,128.5
+TH PADS that Pass = 32; Fails = 14
+NPTH PADS that Pass = 0; Fails = 0

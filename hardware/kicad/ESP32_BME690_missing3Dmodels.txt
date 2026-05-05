@@ -1,0 +1,21 @@
+### Missing 3D models - created on 2026-04-17 11:56
+### Printed by checking_3D_models plugin
+Board file: D:/Documents/Arduino/ESP32/ESP32_BME690/ESP32_BME690/hardware/kicad/ESP32_BME690.kicad_pcb
+3D missing models written to:
+D:\Documents\Arduino\ESP32\ESP32_BME690\ESP32_BME690\hardware\kicad\ESP32_BME690_missing3Dmodels.txt
+-------
+('LED1', 'D:\\Documents\\Arduino\\ESP32\\ESP32_BME690\\ESP32_BME690\\hardware\\kicad\\LTST-C170KRKT.stp')
+('F1', 'D:\\Documents\\Arduino\\ESP32\\ESP32_BME690\\ESP32_BME690\\hardware\\kicad\\0ZCH0110AF2E.stp')
+('C9', 'D:\\Documents\\Arduino\\ESP32\\ESP32_BME690\\ESP32_BME690\\hardware\\kicad\\T491A106K010AT7280.stp')
+('IC1', 'D:\\Documents\\Arduino\\ESP32\\ESP32_BME690\\ESP32_BME690\\hardware\\kicad\\BME690.stp')
+('LED5', 'D:\\Documents\\Arduino\\ESP32\\ESP32_BME690\\ESP32_BME690\\hardware\\kicad\\LTST-C170KRKT.stp')
+('LED3', 'D:\\Documents\\Arduino\\ESP32\\ESP32_BME690\\ESP32_BME690\\hardware\\kicad\\LTST-C170KRKT.stp')
+('U4', 'C:\\Users\\Andrew\\AppData\\Local\\Programs\\KiCad\\10.0\\share\\kicad\\3dmodels\\Package_DFN_QFN.3dshapes\\SiliconLabs_QFN-20-1EP_3x3mm_P0.5mm_EP1.8x1.8mm.step')
+('LED2', 'D:\\Documents\\Arduino\\ESP32\\ESP32_BME690\\ESP32_BME690\\hardware\\kicad\\LTST-C170KRKT.stp')
+('LED6', 'D:\\Documents\\Arduino\\ESP32\\ESP32_BME690\\ESP32_BME690\\hardware\\kicad\\LTST-C170KRKT.stp')
+('LED4', 'D:\\Documents\\Arduino\\ESP32\\ESP32_BME690\\ESP32_BME690\\hardware\\kicad\\LTST-C170KRKT.stp')
+('C14', 'D:\\Documents\\Arduino\\ESP32\\ESP32_BME690\\ESP32_BME690\\hardware\\kicad\\T491A106K010AT7280.stp')
+('C12', 'D:\\Documents\\Arduino\\ESP32\\ESP32_BME690\\ESP32_BME690\\hardware\\kicad\\T491A106K010AT7280.stp')
+-------
+NUM of 3D missing models:12
+checked extensions ['.stp', '.step', '.stpZ']

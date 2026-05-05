@@ -1,0 +1,40 @@
+# Secrets / credentials
+secrets.h
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.theia/
+*.swp
+
+# Node / server
+server/node_modules/
+server/package-lock.json
+npm-debug.log*
+
+# Arduino build artifacts
+build/
+*.hex
+*.bin
+*.elf
+
+# KiCad working files
+*.lck
+*-backups/
+fp-info-cache
+*.kicad_pcb-bak
+*.kicad_sch-bak
+*.kicad_prl
+*.bak
+.history/
+
+# Generated archives (keep board files, drop zips)
+hardware/kicad/*.zip
+
+# Datasheets are not redistributable; keep local only
+docs/
+
+# Local logs / scratch
+*.log
