@@ -70,6 +70,10 @@ float currentLux = 0;
 int currentSoundLevel = 0;
 float currentBatteryVolts = 0;
 int currentBatteryPercent = 0;
+unsigned long soundWindowStart = 0;
+int currentSignalMax = 0;
+int currentSignalMin = 4095;
+int peakVolumeSinceLastUpload = 0;
 
 // --- Function Prototypes ---
 void checkBsecStatus(Bsec2 bsec);
@@ -88,7 +92,7 @@ void displayDataOnOLED(void);
 void printWithLeadingZero(int value);
 String buildBsecDebugString(void);
 void readLightSensor(void);
-void readSoundSensor(void);
+void pollSoundSensor(void);
 void readBattery(void);
 int  getBatteryPercentage(float voltage);
 int  mapFloat(float x, float in_min, float in_max, int out_min, int out_max);
@@ -176,19 +180,26 @@ void setup() {
 void loop() {
   unsigned long currentTime = millis();
 
-  // 1. Let BSEC2 run continuously. It triggers newDataCallback when done.
+  // 1. Listen to the microphone continuously in the background!
+  pollSoundSensor();
+
+  // 2. Let BSEC2 run continuously.
   if (!envSensor.run()) { 
-    checkBsecStatus(envSensor); // Print errors if it fails to process
+    checkBsecStatus(envSensor); 
   }
 
-  // If the callback fired, we have fresh data to process
+  // 3. If BSEC data is ready (every 3 seconds)
   if (newDataAvailable) {
-    newDataAvailable = false; // Reset flag
+    newDataAvailable = false; 
 
     readLightSensor();
-    readSoundSensor();
     readBattery();
+    
+    // Grab the highest volume recorded over the last 3 seconds
+    currentSoundLevel = peakVolumeSinceLastUpload;
+    peakVolumeSinceLastUpload = 0; // Reset it for the next 3-second cycle
 
+    // The rest of your code remains exactly the same...
     bsecLogString = buildBsecDebugString();
     Serial.println(bsecLogString);
 
@@ -198,14 +209,14 @@ void loop() {
     handleBsecStateSaving();
   }
 
-  // 2. Handle NTP sync independently
+  // 4. Handle NTP sync independently
   if (!timeSynchronized) {
     if (currentTime - lastNtpSyncAttempt >= 60000 || lastNtpSyncAttempt == 0) {
       updateNTPTime();
     }
   }
 
-  // 3. Service OTA
+  // 5. Service OTA
   ArduinoOTA.handle();
   yield();
 }
@@ -513,20 +524,28 @@ void readLightSensor(void) {
   currentLux = microamps * 2.0f;
 }
 
-// Peak-to-peak amplitude over a short sample window
-void readSoundSensor(void) {
-  unsigned long startMs = millis();
-  int signalMax = 0;
-  int signalMin = 4095;
-
-  while (millis() - startMs < SOUND_SAMPLE_WINDOW_MS) {
-    int sample = analogRead(MIC_PIN);
-    if (sample < 4095) {
-      if (sample > signalMax) signalMax = sample;
-      else if (sample < signalMin) signalMin = sample;
-    }
+void pollSoundSensor(void) {
+  int sample = analogRead(MIC_PIN);
+  
+  if (sample < 4095) {
+    if (sample > currentSignalMax) currentSignalMax = sample;
+    if (sample < currentSignalMin) currentSignalMin = sample; 
   }
-  currentSoundLevel = signalMax - signalMin;
+
+  // Every 50ms, calculate the amplitude
+  if (millis() - soundWindowStart >= SOUND_SAMPLE_WINDOW_MS) {
+    int peakToPeak = currentSignalMax - currentSignalMin;
+    
+    // Save the loudest sound heard over the last few seconds
+    if (peakToPeak > peakVolumeSinceLastUpload) {
+      peakVolumeSinceLastUpload = peakToPeak;
+    }
+
+    // Reset for the next 50ms window
+    currentSignalMax = 0;
+    currentSignalMin = 4095;
+    soundWindowStart = millis();
+  }
 }
 
 // 1M/1M divider on VBAT_ADC_PIN; uses factory-calibrated millivolt read
