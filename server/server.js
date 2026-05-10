@@ -8,7 +8,7 @@ app.use(express.urlencoded({ extended: true })); // Built-in middleware to parse
 const defaultRoom = () => ({
   temperature: 0, humidity: 0, pressure: 0,
   IAQ: 0, carbon: 0, VOC: 0, IAQsts: "Unknown",
-  lux: 0, sound: 0, battery: 0
+  lux: 0, sound: 0, soundPeak: 0, soundDb: 0, battery: 0
 });
 
 let roomData = {
@@ -22,7 +22,7 @@ app.post('/sensor-data', (req, res) => {
   const {
     location, temperature, humidity, pressure,
     IAQ, carbon, VOC, IAQsts,
-    lux, sound, battery
+    lux, sound, soundPeak, soundDb, battery
   } = req.body;
 
   // Default to "Unknown" if no location is sent
@@ -43,6 +43,8 @@ app.post('/sensor-data', (req, res) => {
   roomData[loc].IAQsts = IAQsts;
   if (lux !== undefined) roomData[loc].lux = lux;
   if (sound !== undefined) roomData[loc].sound = sound;
+  if (soundPeak !== undefined) roomData[loc].soundPeak = soundPeak;
+  if (soundDb !== undefined) roomData[loc].soundDb = soundDb;
   if (battery !== undefined) roomData[loc].battery = battery;
 
   console.log(`[INFO] Received data from ${loc}:`, req.body);
@@ -105,6 +107,8 @@ function SendHTML() {
                             document.getElementById('IAQsts_' + roomID).innerText = data.IAQsts;
                             document.getElementById('lux_' + roomID).innerText = data.lux ?? 0;
                             document.getElementById('sound_' + roomID).innerText = data.sound ?? 0;
+                            document.getElementById('soundPeak_' + roomID).innerText = data.soundPeak ?? 0;
+                            document.getElementById('soundDb_' + roomID).innerText = (data.soundDb ?? 0).toFixed ? (data.soundDb ?? 0).toFixed(1) : (data.soundDb ?? 0);
                             document.getElementById('battery_' + roomID).innerText = data.battery ?? 0;
                         }
                     }
@@ -146,7 +150,7 @@ function generateRoomBox(roomId, displayTitle) {
             <div class='sensors'><p class='sensor'><i class='fas fa-smog' style='color:#35b22d'></i><span class='sensor-labels'> Co2 Eq. </span><span id='carbon_${roomId}'>0</span><span class='units'>PPM</span></p><hr></div>
             <div class='sensors'><p class='sensor'><i class='fas fa-wind' style='color:#0275d8'></i><span class='sensor-labels'> Breath VOC </span><span id='VOC_${roomId}'>0</span><span class='units'>PPM</span></p><hr></div>
             <div class='sensors'><p class='sensor'><i class='fas fa-sun' style='color:#f0ad4e'></i><span class='sensor-labels'> Light </span><span id='lux_${roomId}'>0</span><span class='units'>lx</span></p><hr></div>
-            <div class='sensors'><p class='sensor'><i class='fas fa-volume-up' style='color:#5bc0de'></i><span class='sensor-labels'> Sound </span><span id='sound_${roomId}'>0</span><span class='units'></span></p><hr></div>
+            <div class='sensors'><p class='sensor'><i class='fas fa-volume-up' style='color:#5bc0de'></i><span class='sensor-labels'> Sound </span><span id='soundDb_${roomId}'>0</span><span class='units'>dB</span></p><p style='font-size: 0.85rem; color: #888; margin: -8px 0 8px 28px;'>avg: <span id='sound_${roomId}'>0</span> &middot; peak: <span id='soundPeak_${roomId}'>0</span></p><hr></div>
             <div class='sensors'><p class='sensor'><i class='fas fa-battery-half' style='color:#5cb85c'></i><span class='sensor-labels'> Battery </span><span id='battery_${roomId}'>0</span><span class='units'>%</span></p></div>
         </div>
     </div>
