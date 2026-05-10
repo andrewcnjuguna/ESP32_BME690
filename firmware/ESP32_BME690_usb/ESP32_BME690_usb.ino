@@ -67,13 +67,17 @@ bool newDataAvailable = false;
 
 // Auxiliary sensor readings (light, sound, battery)
 float currentLux = 0;
-int currentSoundLevel = 0;
+int currentSoundLevel = 0;       // Average peak-to-peak amplitude (sustained loudness)
+int currentSoundPeak = 0;        // Loudest single 50ms window in the upload interval
+float currentSoundDb = 0;        // 20*log10(avg) — uncalibrated logarithmic level
 float currentBatteryVolts = 0;
 int currentBatteryPercent = 0;
 unsigned long soundWindowStart = 0;
 int currentSignalMax = 0;
 int currentSignalMin = 4095;
-int peakVolumeSinceLastUpload = 0;
+uint32_t soundSumSinceLastUpload = 0;
+uint16_t soundCountSinceLastUpload = 0;
+int soundPeakSinceLastUpload = 0;
 
 // --- Function Prototypes ---
 void checkBsecStatus(Bsec2 bsec);
@@ -194,10 +198,18 @@ void loop() {
 
     readLightSensor();
     readBattery();
-    
-    // Grab the highest volume recorded over the last 3 seconds
-    currentSoundLevel = peakVolumeSinceLastUpload;
-    peakVolumeSinceLastUpload = 0; // Reset it for the next 3-second cycle
+
+    // Aggregate the last 3 seconds of 50ms peak-to-peak windows
+    if (soundCountSinceLastUpload > 0) {
+      currentSoundLevel = soundSumSinceLastUpload / soundCountSinceLastUpload;
+    } else {
+      currentSoundLevel = 0;
+    }
+    currentSoundPeak = soundPeakSinceLastUpload;
+    currentSoundDb = currentSoundLevel > 0 ? 20.0f * log10f((float)currentSoundLevel) : 0.0f;
+    soundSumSinceLastUpload = 0;
+    soundCountSinceLastUpload = 0;
+    soundPeakSinceLastUpload = 0;
 
     // The rest of your code remains exactly the same...
     bsecLogString = buildBsecDebugString();
@@ -272,7 +284,7 @@ String buildBsecDebugString() {
   log += ", Hum:" + String(currentHum) + "%";    
   log += ", Pres:" + String(currentPress / 100.0) + "hPa";
   log += ", Lux:" + String(currentLux, 1);
-  log += ", Snd:" + String(currentSoundLevel);
+  log += ", Snd:" + String(currentSoundLevel) + " peak:" + String(currentSoundPeak) + " dB:" + String(currentSoundDb, 1);
   log += ", Bat:" + String(currentBatteryVolts, 2) + "V (" + String(currentBatteryPercent) + "%)";
   return log;
 }
@@ -431,7 +443,7 @@ void sendSensorDataToServer() {
   if (!http.begin(serverName)) return;
   http.addHeader("Content-Type", "application/json");
 
-  StaticJsonDocument<400> jsonDoc;
+  StaticJsonDocument<512> jsonDoc;
 
   jsonDoc["location"] = locationID;
   jsonDoc["temperature"] = float(round(currentTemp * 100) / 100.0);
@@ -445,6 +457,8 @@ void sendSensorDataToServer() {
   jsonDoc["IAQsts"] = currentIAQStatusText;
   jsonDoc["lux"] = float(round(currentLux * 10) / 10.0);
   jsonDoc["sound"] = currentSoundLevel;
+  jsonDoc["soundPeak"] = currentSoundPeak;
+  jsonDoc["soundDb"] = float(round(currentSoundDb * 10) / 10.0);
   jsonDoc["batteryVolts"] = float(round(currentBatteryVolts * 100) / 100.0);
   jsonDoc["battery"] = currentBatteryPercent;
 
@@ -535,10 +549,13 @@ void pollSoundSensor(void) {
   // Every 50ms, calculate the amplitude
   if (millis() - soundWindowStart >= SOUND_SAMPLE_WINDOW_MS) {
     int peakToPeak = currentSignalMax - currentSignalMin;
-    
-    // Save the loudest sound heard over the last few seconds
-    if (peakToPeak > peakVolumeSinceLastUpload) {
-      peakVolumeSinceLastUpload = peakToPeak;
+    if (peakToPeak < 0) peakToPeak = 0;
+
+    // Accumulate for the running average across the upload interval
+    soundSumSinceLastUpload += (uint32_t)peakToPeak;
+    soundCountSinceLastUpload++;
+    if (peakToPeak > soundPeakSinceLastUpload) {
+      soundPeakSinceLastUpload = peakToPeak;
     }
 
     // Reset for the next 50ms window
