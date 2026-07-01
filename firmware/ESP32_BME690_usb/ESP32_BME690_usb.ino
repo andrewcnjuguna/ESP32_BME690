@@ -19,6 +19,9 @@
 #include <ArduinoJson.h>
 #include <EEPROM.h>
 #include <ArduinoOTA.h>
+#include <SPI.h>
+#include <SD.h>
+#include "esp_timer.h"
 #include "secrets.h"
 
 // --- Configuration ---
@@ -44,14 +47,25 @@ const char* serverName = SERVER_URL;
 #define BAT_DIVIDER_RATIO 2.0f
 #define SOUND_SAMPLE_WINDOW_MS 50
 
+// SD card (SPI). Own bus, independent of the I2C sensors on 8/9.
+#define SD_CS   10
+#define SD_MOSI 11
+#define SD_SCLK 12
+#define SD_MISO 13
+#define SD_LOG_FILE "/datalog.csv"
+// Averaged sample written to the SD card once per this interval.
+#define SD_LOG_INTERVAL_MS 60000UL
+
 const char* locationID = "Hallway";
 #define OTA_HOSTNAME "esp32-bme690-hallway"
 
 // BSEC State Configuration
-#define EEPROM_SIZE (BSEC_MAX_STATE_BLOB_SIZE + 10) 
+#define EEPROM_SIZE (BSEC_MAX_STATE_BLOB_SIZE + 16)
 #define BSEC_STATE_EEPROM_ADDR 0
 #define BSEC_STATE_MAGIC_NUMBER_ADDR (BSEC_STATE_EEPROM_ADDR + BSEC_MAX_STATE_BLOB_SIZE)
 #define BSEC_STATE_VALID_MAGIC 0x42
+// Boot counter lives past the BSEC state blob + its magic byte (4 bytes, uint32).
+#define BOOT_ID_EEPROM_ADDR (BSEC_STATE_MAGIC_NUMBER_ADDR + 4)
 const unsigned long BSEC_STATE_SAVE_INTERVAL_MS = 4 * 60 * 60 * 1000;
 
 // NTP Configuration
@@ -99,6 +113,25 @@ uint32_t soundSumSinceLastUpload = 0;
 uint16_t soundCountSinceLastUpload = 0;
 int soundPeakSinceLastUpload = 0;
 
+// --- SD data logging ---
+bool sdAvailable = false;
+uint32_t bootId = 0;
+// bootEpoch = wall-clock time (Unix seconds) at uptime 0. Once NTP syncs, this
+// lets any row's true time be reconstructed as bootEpoch + uptime, even rows
+// written before the sync. Zero until the first successful NTP sync.
+time_t bootEpoch = 0;
+bool bootEpochValid = false;
+unsigned long lastSdLogTime = 0;
+
+// Accumulators for the averaged 60s SD row (summed every 3s BSEC cycle).
+struct LogAccum {
+  double temp, hum, press, iaq, staticIaq, co2, voc, lux, soundDb, soundAvg;
+  double batV, batPct;
+  long   soundPeak;
+  uint8_t iaqAcc;
+  uint16_t n;
+} logAccum = {0};
+
 // --- Function Prototypes ---
 void setupBsec(void);
 void bsec3Run(void);
@@ -110,8 +143,14 @@ void connectToWiFi(void);
 void setupOTA(void);
 void setupWebServer(void);
 void handleRoot(void);
+void handleDownloadLog(void);
 int  rssiToPercent(long rssi);
 const char* wifiQualityLabel(long rssi);
+void setupSD(void);
+uint32_t nextBootId(void);
+int64_t uptimeSeconds(void);
+void accumulateLogSample(void);
+void logToSD(void);
 void initNTP(void);
 void updateNTPTime(void);
 void updateAndLogIAQStatusText(void);
@@ -128,7 +167,10 @@ int  mapFloat(float x, float in_min, float in_max, int out_min, int out_max);
 // --- Setup ---
 void setup() {
   Serial.begin(115200);
-  while (!Serial) delay(10); 
+  // Wait briefly for a USB host, but never block boot when deployed headless
+  // on a plain charger (native-USB S3 keeps !Serial true with no host).
+  unsigned long serialWaitStart = millis();
+  while (!Serial && millis() - serialWaitStart < 2000) delay(10);
   Serial.println("\n[INFO] Booting up sensor node...");
 
   pinMode(ERROR_LED_PIN, OUTPUT);
@@ -159,7 +201,12 @@ void setup() {
   } else {
     Serial.println("[INFO] EEPROM initialized.");
   }
-  
+
+  // Bump the boot counter (groups a power session in the log) and mount the SD.
+  bootId = nextBootId();
+  Serial.println("[INFO] Boot ID: " + String(bootId));
+  setupSD();
+
   connectToWiFi();
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -217,6 +264,14 @@ void loop() {
     sendSensorDataToServer();
     displayDataOnOLED();
     handleBsecStateSaving();
+
+    // Fold this 3s sample into the running average, and flush a row to the
+    // SD card once per SD_LOG_INTERVAL_MS (60s).
+    accumulateLogSample();
+    if (currentTime - lastSdLogTime >= SD_LOG_INTERVAL_MS || lastSdLogTime == 0) {
+      logToSD();
+      lastSdLogTime = currentTime;
+    }
   }
 
   // 4. Handle NTP sync independently
@@ -500,9 +555,106 @@ const char* wifiQualityLabel(long rssi) {
   return "Poor";
 }
 
+// ===========================================================================
+//  SD data logging (CSV). Averages the ~20 BSEC samples between writes into a
+//  single 60s row. Timestamps use bootEpoch + uptime so a session that syncs
+//  NTP at any point gets absolute time for all of its rows (see updateNTPTime).
+// ===========================================================================
+
+// Monotonic seconds since boot, immune to the 49-day millis() rollover.
+int64_t uptimeSeconds() { return esp_timer_get_time() / 1000000LL; }
+
+// Read, increment, and persist the boot counter. 0xFFFFFFFF (blank EEPROM) -> 0.
+uint32_t nextBootId() {
+  uint32_t id = 0;
+  EEPROM.get(BOOT_ID_EEPROM_ADDR, id);
+  if (id == 0xFFFFFFFFUL) id = 0;
+  id++;
+  EEPROM.put(BOOT_ID_EEPROM_ADDR, id);
+  EEPROM.commit();
+  return id;
+}
+
+void setupSD() {
+  SPI.begin(SD_SCLK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS, SPI)) {
+    Serial.println("[SD] Card mount failed - logging disabled.");
+    sdAvailable = false;
+    return;
+  }
+  sdAvailable = true;
+  Serial.println("[SD] Card mounted. Type: " + String(SD.cardType()) +
+                 ", size: " + String((uint32_t)(SD.cardSize() / (1024ULL * 1024ULL))) + " MB");
+
+  // Write the CSV header once, when the file is first created.
+  if (!SD.exists(SD_LOG_FILE)) {
+    File f = SD.open(SD_LOG_FILE, FILE_WRITE);
+    if (f) {
+      f.println("boot_id,uptime_s,epoch,synced,temp_c,hum_pct,press_hpa,iaq,iaq_acc,"
+                "co2_ppm,voc_ppm,lux,sound_db,sound_avg,sound_peak,batt_v,batt_pct");
+      f.close();
+      Serial.println("[SD] Created " SD_LOG_FILE " with header.");
+    } else {
+      Serial.println("[SD] Failed to create log file.");
+    }
+  }
+}
+
+// Fold the current 3s readings into the running average for the next SD row.
+void accumulateLogSample() {
+  logAccum.temp      += currentTemp;
+  logAccum.hum       += currentHum;
+  logAccum.press     += currentPress / 100.0;   // hPa
+  logAccum.iaq       += (currentStaticIAQ > 0 && currentIAQAccuracy > 0) ? currentStaticIAQ : currentIAQ;
+  logAccum.staticIaq += currentStaticIAQ;
+  logAccum.co2       += currentCO2;
+  logAccum.voc       += currentVOC;
+  logAccum.lux       += currentLux;
+  logAccum.soundDb   += currentSoundDb;
+  logAccum.soundAvg  += currentSoundLevel;
+  if (currentSoundPeak > logAccum.soundPeak) logAccum.soundPeak = currentSoundPeak;
+  logAccum.batV      += currentBatteryVolts;
+  logAccum.batPct    += currentBatteryPercent;
+  if (currentIAQAccuracy > logAccum.iaqAcc) logAccum.iaqAcc = currentIAQAccuracy;
+  logAccum.n++;
+}
+
+// Write one averaged row, then reset the accumulator. Opens/flushes/closes each
+// time so a power cut can lose at most the current row, never the whole file.
+void logToSD() {
+  if (!sdAvailable || logAccum.n == 0) { memset(&logAccum, 0, sizeof(logAccum)); return; }
+
+  uint16_t n = logAccum.n;
+  int64_t up = uptimeSeconds();
+  long epoch = bootEpochValid ? (long)(bootEpoch + up) : 0;
+  int synced = bootEpochValid ? 1 : 0;
+
+  char row[220];
+  snprintf(row, sizeof(row),
+    "%lu,%ld,%ld,%d,%.2f,%.2f,%.2f,%.0f,%u,%.0f,%.2f,%.1f,%.1f,%.0f,%ld,%.2f,%.0f",
+    (unsigned long)bootId, (long)up, epoch, synced,
+    logAccum.temp / n, logAccum.hum / n, logAccum.press / n,
+    logAccum.iaq / n, (unsigned)logAccum.iaqAcc,
+    logAccum.co2 / n, logAccum.voc / n, logAccum.lux / n,
+    logAccum.soundDb / n, logAccum.soundAvg / n, logAccum.soundPeak,
+    logAccum.batV / n, logAccum.batPct / n);
+
+  File f = SD.open(SD_LOG_FILE, FILE_APPEND);
+  if (f) {
+    f.println(row);
+    f.close();
+  } else {
+    Serial.println("[SD] Append failed; attempting remount.");
+    sdAvailable = false;
+    setupSD();   // try to recover a card that was reseated or hiccuped
+  }
+  memset(&logAccum, 0, sizeof(logAccum));
+}
+
 // --- Web server: a small live-status page that auto-refreshes every 5s. ---
 void setupWebServer() {
   server.on("/", handleRoot);
+  server.on(SD_LOG_FILE, handleDownloadLog);   // "/datalog.csv"
   server.begin();
   Serial.print("[INFO] Web UI at http://"); Serial.println(WiFi.localIP());
 }
@@ -535,9 +687,35 @@ void handleRoot() {
   row("Battery",     String(currentBatteryPercent) + " % (" + String(currentBatteryVolts, 2) + " V)");
   long rssi = WiFi.RSSI();
   row("WiFi signal", String(rssi) + " dBm (" + String(rssiToPercent(rssi)) + "% " + wifiQualityLabel(rssi) + ")");
-  html += F("</table></body></html>");
+
+  // SD logging status: mounted? file size? is the timestamp anchored yet?
+  if (sdAvailable) {
+    uint32_t bytes = 0;
+    File f = SD.open(SD_LOG_FILE, FILE_READ);
+    if (f) { bytes = f.size(); f.close(); }
+    row("Data log", String(bytes / 1024.0, 1) + " KB, " +
+                    (bootEpochValid ? "time synced" : "time NOT synced"));
+  } else {
+    row("Data log", "SD not available");
+  }
+  html += F("</table>");
+  if (sdAvailable) html += F("<p><a href='/datalog.csv'>Download datalog.csv</a></p>");
+  html += F("</body></html>");
 
   server.send(200, "text/html", html);
+}
+
+// Stream the CSV log to the browser as a file download.
+void handleDownloadLog() {
+  if (!sdAvailable || !SD.exists(SD_LOG_FILE)) {
+    server.send(404, "text/plain", "No log file on SD.");
+    return;
+  }
+  File f = SD.open(SD_LOG_FILE, FILE_READ);
+  if (!f) { server.send(500, "text/plain", "Could not open log."); return; }
+  server.sendHeader("Content-Disposition", "attachment; filename=datalog.csv");
+  server.streamFile(f, "text/csv");
+  f.close();
 }
 
 void initNTP() {
@@ -567,6 +745,13 @@ void updateNTPTime() {
         Serial.print("[NTP] Current time: ");
         Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
         timeSynchronized = true;
+        // Anchor uptime to wall-clock time once, so every logged row (past and
+        // future in this power session) can be given an absolute timestamp.
+        if (!bootEpochValid) {
+            bootEpoch = time(nullptr) - (time_t)uptimeSeconds();
+            bootEpochValid = true;
+            Serial.println("[LOG] Boot epoch anchored: " + String((long)bootEpoch));
+        }
     }
 }
 
