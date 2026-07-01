@@ -1,9 +1,20 @@
 #include <WiFi.h>
+#include <WebServer.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH110X.h>
 #include "time.h"
-#include <bsec2.h>          // NEW: Bosch BSEC2 library
+// BSEC3 + BME690 (bme69x). The BME690 reports variant 0x02, which the old
+// BSEC2/BME68x stack mis-reads (garbage pressure). BSEC3 handles it correctly.
+#include "bsec_interface.h"
+#include "bsec_datatypes.h"
+#include "bme69x.h"
+#ifndef BSEC_INSTANCE_SIZE
+#define BSEC_INSTANCE_SIZE  UINT16_C(3272)   // from Bosch BME690 bsec_integration.h
+#endif
+#ifndef BSEC_CHECK_INPUT
+#define BSEC_CHECK_INPUT(x, shift)  ((x) & (1 << ((shift) - 1)))
+#endif
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <EEPROM.h>
@@ -33,8 +44,8 @@ const char* serverName = SERVER_URL;
 #define BAT_DIVIDER_RATIO 2.0f
 #define SOUND_SAMPLE_WINDOW_MS 50
 
-const char* locationID = "Kitchen";
-#define OTA_HOSTNAME "esp32-bme690-kitchen"
+const char* locationID = "Hallway";
+#define OTA_HOSTNAME "esp32-bme690-hallway"
 
 // BSEC State Configuration
 #define EEPROM_SIZE (BSEC_MAX_STATE_BLOB_SIZE + 10) 
@@ -51,7 +62,16 @@ unsigned long lastNtpSyncAttempt = 0;
 
 // --- Global Objects ---
 Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-Bsec2 envSensor; // BSEC2 Object
+WebServer server(80);
+
+// --- BSEC3 + BME690 driver state ---
+extern "C" { extern const uint8_t bsec_config_iaq[]; }   // bme690_iaq_33v_3s_28d blob
+static uint8_t  bsecInstanceMem[BSEC_INSTANCE_SIZE];
+static void*    bsecInst = bsecInstanceMem;
+static uint8_t  bsecWorkBuffer[BSEC_MAX_WORKBUFFER_SIZE];
+static int64_t  bsecNextCallNs = 0;
+static struct bme69x_dev bme;
+static uint8_t  bmeI2cAddr = BME69X_I2C_ADDR_LOW;        // 0x76
 
 // --- Global Variables for Sensor Data ---
 String bsecLogString;
@@ -80,14 +100,18 @@ uint16_t soundCountSinceLastUpload = 0;
 int soundPeakSinceLastUpload = 0;
 
 // --- Function Prototypes ---
-void checkBsecStatus(Bsec2 bsec);
-void newDataCallback(const bme68xData data, const bsecOutputs outputs, Bsec2 bsec);
+void setupBsec(void);
+void bsec3Run(void);
 void handleErrorCondition(void);
 void loadBsecState(void);
 void saveBsecState(void);
 void handleBsecStateSaving(void);
 void connectToWiFi(void);
 void setupOTA(void);
+void setupWebServer(void);
+void handleRoot(void);
+int  rssiToPercent(long rssi);
+const char* wifiQualityLabel(long rssi);
 void initNTP(void);
 void updateNTPTime(void);
 void updateAndLogIAQStatusText(void);
@@ -140,37 +164,13 @@ void setup() {
 
   if (WiFi.status() == WL_CONNECTED) {
     setupOTA();
+    setupWebServer();
   }
 
   initNTP();
 
-  // Initialize BSEC2 Sensor
-  envSensor.begin(BME68X_I2C_ADDR_LOW, Wire); 
-  Serial.println("[INFO] BSEC library version " + String(envSensor.version.major) + "." +
-                   String(envSensor.version.minor) + "." + String(envSensor.version.major_bugfix) +
-                   "." + String(envSensor.version.minor_bugfix));
-  checkBsecStatus(envSensor);
-
-  loadBsecState(); 
-
-  // Attach callback for BSEC2
-  envSensor.attachCallback(newDataCallback);
-
-  bsecSensor sensorList[] = {
-    BSEC_OUTPUT_RAW_TEMPERATURE,
-    BSEC_OUTPUT_RAW_PRESSURE,
-    BSEC_OUTPUT_RAW_HUMIDITY,
-    BSEC_OUTPUT_IAQ,                            
-    BSEC_OUTPUT_STATIC_IAQ,                     
-    BSEC_OUTPUT_CO2_EQUIVALENT,                 
-    BSEC_OUTPUT_BREATH_VOC_EQUIVALENT,          
-    BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_TEMPERATURE, 
-    BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_HUMIDITY,   
-  };
-  
-  // Wait for 3 seconds per measurement (Low Power)
-  envSensor.updateSubscription(sensorList, ARRAY_LEN(sensorList), BSEC_SAMPLE_RATE_LP);
-  checkBsecStatus(envSensor);
+  // Initialize the BME690 via BSEC3 (forced mode, low-power 3s rate)
+  setupBsec();
 
   Serial.println("[INFO] Setup complete. Starting main loop.");
   display.clearDisplay();
@@ -187,10 +187,8 @@ void loop() {
   // 1. Listen to the microphone continuously in the background!
   pollSoundSensor();
 
-  // 2. Let BSEC2 run continuously.
-  if (!envSensor.run()) { 
-    checkBsecStatus(envSensor); 
-  }
+  // 2. Step the BSEC3 driver (runs a forced measurement when due).
+  bsec3Run();
 
   // 3. If BSEC data is ready (every 3 seconds)
   if (newDataAvailable) {
@@ -228,48 +226,167 @@ void loop() {
     }
   }
 
-  // 5. Service OTA
+  // 5. Service OTA and the web UI
   ArduinoOTA.handle();
+  server.handleClient();
   yield();
 }
 
-// --- BSEC Callback ---
-// This is triggered natively by the BSEC2 algorithm every 3 seconds
-void newDataCallback(const bme68xData data, const bsecOutputs outputs, Bsec2 bsec) {
-  if (!outputs.nOutputs) {
-    return;
-  }
+// ===========================================================================
+//  BSEC3 + BME690 forced-mode driver (cooperative; adapted from Bosch's
+//  bsec_integration.c). Replaces the BSEC2 callback model.
+// ===========================================================================
 
-  for (uint8_t i = 0; i < outputs.nOutputs; i++) {
-    const bsecData output  = outputs.output[i];
-    switch (output.sensor_id) {
+// I2C glue mapping the bme69x API onto the Arduino Wire bus.
+static BME69X_INTF_RET_TYPE bmeI2cRead(uint8_t reg, uint8_t *data, uint32_t len, void *intf) {
+  uint8_t addr = *(uint8_t*)intf;
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return BME69X_E_COM_FAIL;
+  if (Wire.requestFrom((int)addr, (int)len) != len) return BME69X_E_COM_FAIL;
+  for (uint32_t i = 0; i < len; i++) data[i] = Wire.read();
+  return BME69X_INTF_RET_SUCCESS;
+}
+static BME69X_INTF_RET_TYPE bmeI2cWrite(uint8_t reg, const uint8_t *data, uint32_t len, void *intf) {
+  uint8_t addr = *(uint8_t*)intf;
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  for (uint32_t i = 0; i < len; i++) Wire.write(data[i]);
+  return (Wire.endTransmission() == 0) ? BME69X_INTF_RET_SUCCESS : BME69X_E_COM_FAIL;
+}
+static void bmeDelayUs(uint32_t period, void *intf) { delayMicroseconds(period); }
+
+static void logBsec(const char* what, int rc) {
+  if (rc != BSEC_OK) Serial.println("[BSEC] " + String(what) + " rc=" + String(rc));
+}
+
+void setupBsec() {
+  memset(&bme, 0, sizeof(bme));
+  bme.read = bmeI2cRead;
+  bme.write = bmeI2cWrite;
+  bme.delay_us = bmeDelayUs;
+  bme.intf = BME69X_I2C_INTF;
+  bme.intf_ptr = &bmeI2cAddr;
+  bme.amb_temp = 25;
+
+  int8_t brc = bme69x_init(&bme);
+  if (brc != BME69X_OK)
+    Serial.println("[BME690] init failed rc=" + String(brc));
+  else
+    Serial.println("[BME690] init OK, variant-ID=0x" + String(bme.variant_id, HEX) + " (0x02 = BME690)");
+
+  logBsec("init", bsec_init(bsecInst));
+
+  bsec_version_t v;
+  if (bsec_get_version(bsecInst, &v) == BSEC_OK)
+    Serial.println("[BSEC] v" + String(v.major) + "." + String(v.minor) + "." +
+                   String(v.major_bugfix) + "." + String(v.minor_bugfix));
+
+  logBsec("set_configuration",
+          bsec_set_configuration(bsecInst, bsec_config_iaq, BSEC_MAX_PROPERTY_BLOB_SIZE,
+                                 bsecWorkBuffer, sizeof(bsecWorkBuffer)));
+
+  loadBsecState();
+
+  bsec_sensor_configuration_t requested[7];
+  bsec_sensor_configuration_t required[BSEC_MAX_PHYSICAL_SENSOR];
+  uint8_t nRequired = BSEC_MAX_PHYSICAL_SENSOR;
+  const float rate = BSEC_SAMPLE_RATE_LP;
+  uint8_t i = 0;
+  requested[i].sensor_id = BSEC_OUTPUT_RAW_PRESSURE;                        requested[i++].sample_rate = rate;
+  requested[i].sensor_id = BSEC_OUTPUT_IAQ;                                 requested[i++].sample_rate = rate;
+  requested[i].sensor_id = BSEC_OUTPUT_STATIC_IAQ;                          requested[i++].sample_rate = rate;
+  requested[i].sensor_id = BSEC_OUTPUT_CO2_EQUIVALENT;                      requested[i++].sample_rate = rate;
+  requested[i].sensor_id = BSEC_OUTPUT_TVOC_EQUIVALENT;                     requested[i++].sample_rate = rate;
+  requested[i].sensor_id = BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_TEMPERATURE; requested[i++].sample_rate = rate;
+  requested[i].sensor_id = BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_HUMIDITY;    requested[i++].sample_rate = rate;
+  logBsec("update_subscription",
+          bsec_update_subscription(bsecInst, requested, i, required, &nRequired));
+}
+
+static void parseBsecOutputs(const bsec_output_t* out, uint8_t n) {
+  for (uint8_t i = 0; i < n; i++) {
+    switch (out[i].sensor_id) {
+      case BSEC_OUTPUT_RAW_PRESSURE:                        currentPress = out[i].signal; break;
       case BSEC_OUTPUT_IAQ:
-        currentIAQ = output.signal;
-        currentIAQAccuracy = output.accuracy;
-        break;
-      case BSEC_OUTPUT_STATIC_IAQ:
-        currentStaticIAQ = output.signal;
-        break;
-      case BSEC_OUTPUT_CO2_EQUIVALENT:
-        currentCO2 = output.signal;
-        break;
-      case BSEC_OUTPUT_BREATH_VOC_EQUIVALENT:
-        currentVOC = output.signal;
-        break;
-      case BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_TEMPERATURE:
-        currentTemp = output.signal;
-        break;
-      case BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_HUMIDITY:
-        currentHum = output.signal;
-        break;
-      case BSEC_OUTPUT_RAW_PRESSURE:
-        currentPress = output.signal;
-        break;
-      default:
-        break;
+        currentIAQ = out[i].signal; currentIAQAccuracy = out[i].accuracy; break;
+      case BSEC_OUTPUT_STATIC_IAQ:                          currentStaticIAQ = out[i].signal; break;
+      case BSEC_OUTPUT_CO2_EQUIVALENT:                      currentCO2 = out[i].signal; break;
+      case BSEC_OUTPUT_TVOC_EQUIVALENT:                     currentVOC = out[i].signal; break;
+      case BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_TEMPERATURE: currentTemp = out[i].signal; break;
+      case BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_HUMIDITY:    currentHum = out[i].signal; break;
+      default: break;
     }
   }
-  newDataAvailable = true; // Tell the main loop to publish/display data
+}
+
+void bsec3Run() {
+  int64_t now = (int64_t)millis() * INT64_C(1000000);   // ns
+  if (now < bsecNextCallNs) return;
+
+  bsec_bme_settings_t s;
+  memset(&s, 0, sizeof(s));
+  if (bsec_sensor_control(bsecInst, now, &s) != BSEC_OK) return;
+  bsecNextCallNs = s.next_call;
+
+  if (!s.trigger_measurement || s.op_mode == BME69X_SLEEP_MODE) return;
+
+  struct bme69x_conf conf;
+  if (bme69x_get_conf(&conf, &bme) != BME69X_OK) return;
+  conf.os_hum  = s.humidity_oversampling;
+  conf.os_temp = s.temperature_oversampling;
+  conf.os_pres = s.pressure_oversampling;
+  if (bme69x_set_conf(&conf, &bme) != BME69X_OK) return;
+
+  struct bme69x_heatr_conf hconf;
+  memset(&hconf, 0, sizeof(hconf));
+  hconf.enable     = BME69X_ENABLE;
+  hconf.heatr_temp = s.heater_temperature;
+  hconf.heatr_dur  = s.heater_duration;
+  if (bme69x_set_heatr_conf(BME69X_FORCED_MODE, &hconf, &bme) != BME69X_OK) return;
+  if (bme69x_set_op_mode(BME69X_FORCED_MODE, &bme) != BME69X_OK) return;
+
+  uint32_t durUs = bme69x_get_meas_dur(BME69X_FORCED_MODE, &conf, &bme) +
+                   (uint32_t)s.heater_duration * 1000U;
+  delay(durUs / 1000U + 1U);
+
+  struct bme69x_data data;
+  uint8_t nFields = 0;
+  if (bme69x_get_data(BME69X_FORCED_MODE, &data, &nFields, &bme) != BME69X_OK || nFields == 0)
+    return;
+
+  // In FPU mode (BME69X_USE_FPU) the readings are already deg C / %RH / Pa / Ohm.
+#ifdef BME69X_USE_FPU
+  float tIn = data.temperature, hIn = data.humidity;
+#else
+  float tIn = data.temperature / 100.0f, hIn = data.humidity / 1024.0f;
+#endif
+
+  bsec_input_t in[BSEC_MAX_PHYSICAL_SENSOR];
+  uint8_t n = 0;
+  if (BSEC_CHECK_INPUT(s.process_data, BSEC_INPUT_HEATSOURCE)) {
+    in[n].sensor_id = BSEC_INPUT_HEATSOURCE; in[n].signal = 0.0f; in[n].time_stamp = now; n++;
+  }
+  if (BSEC_CHECK_INPUT(s.process_data, BSEC_INPUT_TEMPERATURE)) {
+    in[n].sensor_id = BSEC_INPUT_TEMPERATURE; in[n].signal = tIn; in[n].time_stamp = now; n++;
+  }
+  if (BSEC_CHECK_INPUT(s.process_data, BSEC_INPUT_HUMIDITY)) {
+    in[n].sensor_id = BSEC_INPUT_HUMIDITY; in[n].signal = hIn; in[n].time_stamp = now; n++;
+  }
+  if (BSEC_CHECK_INPUT(s.process_data, BSEC_INPUT_PRESSURE)) {
+    in[n].sensor_id = BSEC_INPUT_PRESSURE; in[n].signal = data.pressure; in[n].time_stamp = now; n++;
+  }
+  if (BSEC_CHECK_INPUT(s.process_data, BSEC_INPUT_GASRESISTOR) && (data.status & BME69X_GASM_VALID_MSK)) {
+    in[n].sensor_id = BSEC_INPUT_GASRESISTOR; in[n].signal = data.gas_resistance; in[n].time_stamp = now; n++;
+  }
+  if (n == 0) return;
+
+  bsec_output_t out[BSEC_NUMBER_OUTPUTS];
+  uint8_t nOut = BSEC_NUMBER_OUTPUTS;
+  if (bsec_do_steps(bsecInst, in, n, out, &nOut) == BSEC_OK) {
+    parseBsecOutputs(out, nOut);
+    newDataAvailable = true;
+  }
 }
 
 // --- Helper Functions ---
@@ -289,26 +406,6 @@ String buildBsecDebugString() {
   return log;
 }
 
-void checkBsecStatus(Bsec2 bsec) {
-  bool isError = false; 
-
-  if (bsec.status < BSEC_OK) { 
-    Serial.print("[ERROR] BSEC status: "); Serial.println(bsec.status);
-    isError = true;
-  } else if (bsec.status > BSEC_OK) { 
-    Serial.print("[WARNING] BSEC status: "); Serial.println(bsec.status);
-  }
-
-  if (bsec.sensor.status < BME68X_OK) { 
-    Serial.print("[ERROR] BME68X sensor status: "); Serial.println(bsec.sensor.status);
-    isError = true;
-  } else if (bsec.sensor.status > BME68X_OK) { 
-    Serial.print("[WARNING] BME68X sensor status: "); Serial.println(bsec.sensor.status);
-  }
-
-  if (isError) handleErrorCondition(); 
-}
-
 void handleErrorCondition(void) {
   Serial.println("[FATAL] Unrecoverable error. Halting.");
   while (true) {
@@ -325,8 +422,9 @@ void loadBsecState(void) {
     for (uint16_t i = 0; i < BSEC_MAX_STATE_BLOB_SIZE; i++) {
       bsecState[i] = EEPROM.read(BSEC_STATE_EEPROM_ADDR + i);
     }
-    envSensor.setState(bsecState);
-    checkBsecStatus(envSensor); 
+    logBsec("set_state",
+            bsec_set_state(bsecInst, bsecState, BSEC_MAX_STATE_BLOB_SIZE,
+                           bsecWorkBuffer, sizeof(bsecWorkBuffer)));
     Serial.println("[INFO] BSEC state loaded.");
   } else {
     Serial.println("[INFO] No valid BSEC state found in EEPROM. Starting fresh.");
@@ -334,17 +432,19 @@ void loadBsecState(void) {
 }
 
 void saveBsecState(void) {
-  Serial.println("[INFO] Saving BSEC state to EEPROM...");
-  envSensor.getState(bsecState);
-  checkBsecStatus(envSensor); 
+  uint32_t len = 0;
+  int rc = bsec_get_state(bsecInst, 0, bsecState, BSEC_MAX_STATE_BLOB_SIZE,
+                          bsecWorkBuffer, sizeof(bsecWorkBuffer), &len);
+  if (rc != BSEC_OK || len == 0) { logBsec("get_state", rc); return; }
 
-  for (uint16_t i = 0; i < BSEC_MAX_STATE_BLOB_SIZE; i++) {
+  Serial.println("[INFO] Saving BSEC state to EEPROM...");
+  for (uint16_t i = 0; i < len; i++) {
     EEPROM.write(BSEC_STATE_EEPROM_ADDR + i, bsecState[i]);
   }
   EEPROM.write(BSEC_STATE_MAGIC_NUMBER_ADDR, BSEC_STATE_VALID_MAGIC);
 
   if (EEPROM.commit()) {
-    Serial.println("[INFO] BSEC state saved successfully.");
+    Serial.println("[INFO] BSEC state saved successfully (" + String(len) + " bytes).");
     lastBsecStateSaveTime = millis();
   } else {
     Serial.println("[ERROR] Failed to commit BSEC state to EEPROM.");
@@ -382,6 +482,62 @@ void setupOTA() {
   ArduinoOTA.setHostname(OTA_HOSTNAME);
   ArduinoOTA.begin();
   Serial.println("[OTA] Ready. Hostname: " + String(OTA_HOSTNAME));
+}
+
+// Convert WiFi RSSI (dBm) to an approximate 0-100% quality.
+int rssiToPercent(long rssi) {
+  if (rssi <= -100) return 0;
+  if (rssi >= -50)  return 100;
+  return 2 * (int)(rssi + 100);
+}
+
+// Short human label for the current signal strength.
+const char* wifiQualityLabel(long rssi) {
+  if (rssi >= -55) return "Excellent";
+  if (rssi >= -65) return "Good";
+  if (rssi >= -75) return "Fair";
+  if (rssi >= -85) return "Weak";
+  return "Poor";
+}
+
+// --- Web server: a small live-status page that auto-refreshes every 5s. ---
+void setupWebServer() {
+  server.on("/", handleRoot);
+  server.begin();
+  Serial.print("[INFO] Web UI at http://"); Serial.println(WiFi.localIP());
+}
+
+void handleRoot() {
+  String html = F("<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                  "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                  "<meta http-equiv='refresh' content='5'>"
+                  "<title>ESP32 BME690</title>"
+                  "<style>body{font-family:sans-serif;margin:1.2em;max-width:30em}"
+                  "h1{font-size:1.2em}table{border-collapse:collapse;width:100%}"
+                  "td{padding:.25em .5em;border-bottom:1px solid #ddd}"
+                  "td:last-child{text-align:right;font-weight:bold}</style>"
+                  "</head><body><h1>");
+  html += locationID;
+  html += F(" sensor node</h1><table>");
+
+  auto row = [&](const char* k, const String& v) { html += "<tr><td>" + String(k) + "</td><td>" + v + "</td></tr>"; };
+  float displayIAQ = (currentStaticIAQ > 0 && currentIAQAccuracy > 0) ? currentStaticIAQ : currentIAQ;
+  row("Temperature", String(currentTemp, 1) + " &deg;C");
+  row("Humidity",    String(currentHum, 1) + " %");
+  row("Pressure",    String(currentPress / 100.0, 1) + " hPa");
+  row("IAQ",         String(displayIAQ, 0) + " (acc " + String(currentIAQAccuracy) + ")");
+  row("Air quality", currentIAQStatusText);
+  row("CO2 eq",      String(currentCO2, 0) + " ppm");
+  row("VOC eq",      String(currentVOC, 2) + " ppm");
+  row("Light",       String(currentLux, 1) + " lux");
+  row("Sound",       String(currentSoundDb, 1) + " dB (avg " + String(currentSoundLevel) +
+                     ", peak " + String(currentSoundPeak) + ")");
+  row("Battery",     String(currentBatteryPercent) + " % (" + String(currentBatteryVolts, 2) + " V)");
+  long rssi = WiFi.RSSI();
+  row("WiFi signal", String(rssi) + " dBm (" + String(rssiToPercent(rssi)) + "% " + wifiQualityLabel(rssi) + ")");
+  html += F("</table></body></html>");
+
+  server.send(200, "text/html", html);
 }
 
 void initNTP() {
