@@ -68,6 +68,12 @@ const char* locationID = "Hallway";
 #define BOOT_ID_EEPROM_ADDR (BSEC_STATE_MAGIC_NUMBER_ADDR + 4)
 const unsigned long BSEC_STATE_SAVE_INTERVAL_MS = 4 * 60 * 60 * 1000;
 
+// WiFi recovery: OTA + web UI start on the first successful connection (even
+// if that happens long after boot) and a reconnect is kicked off while down.
+bool netServicesStarted = false;
+unsigned long lastWifiRetry = 0;
+const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
+
 // NTP Configuration
 const char* ntpServer = "pool.ntp.org";
 const char* timeZone = "CET-1CEST,M3.5.0,M10.5.0/3"; 
@@ -140,6 +146,7 @@ void loadBsecState(void);
 void saveBsecState(void);
 void handleBsecStateSaving(void);
 void connectToWiFi(void);
+void maintainWiFi(void);
 void setupOTA(void);
 void setupWebServer(void);
 void handleRoot(void);
@@ -208,11 +215,7 @@ void setup() {
   setupSD();
 
   connectToWiFi();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    setupOTA();
-    setupWebServer();
-  }
+  maintainWiFi();   // starts OTA + web UI now if the connection already came up
 
   initNTP();
 
@@ -281,9 +284,13 @@ void loop() {
     }
   }
 
-  // 5. Service OTA and the web UI
-  ArduinoOTA.handle();
-  server.handleClient();
+  // 5. Keep WiFi alive (starts OTA + web UI on a late or re-connect), then
+  //    service them once they exist
+  maintainWiFi();
+  if (netServicesStarted) {
+    ArduinoOTA.handle();
+    server.handleClient();
+  }
   yield();
 }
 
@@ -519,6 +526,7 @@ void handleBsecStateSaving(void) {
 void connectToWiFi() {
   Serial.print("[INFO] Connecting to WiFi: ");
   Serial.println(ssid);
+  WiFi.setAutoReconnect(true);   // let the stack heal brief AP dropouts itself
   WiFi.begin(ssid, password);
   int retries = 0;
   while (WiFi.status() != WL_CONNECTED && retries < 30) { 
@@ -531,6 +539,29 @@ void connectToWiFi() {
   } else {
     Serial.println("\n[ERROR] Failed to connect to WiFi.");
   }
+}
+
+// Keep the WiFi link alive without ever blocking the sensor loop. Starts the
+// network services (OTA + web UI) on the first successful connection —
+// whether that happens at boot or hours later because the router was down —
+// and kicks off a non-blocking reconnect attempt every WIFI_RETRY_INTERVAL_MS
+// while the link stays down.
+void maintainWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!netServicesStarted) {
+      Serial.print("[INFO] WiFi up, IP: "); Serial.println(WiFi.localIP());
+      setupOTA();
+      setupWebServer();
+      netServicesStarted = true;
+    }
+    return;
+  }
+
+  if (lastWifiRetry != 0 && millis() - lastWifiRetry < WIFI_RETRY_INTERVAL_MS) return;
+  lastWifiRetry = millis();
+  Serial.println("[WiFi] Link down - retrying connection...");
+  WiFi.disconnect();
+  WiFi.begin(ssid, password);
 }
 
 void setupOTA() {
@@ -802,6 +833,10 @@ void sendSensorDataToServer() {
   jsonDoc["soundDb"] = float(round(currentSoundDb * 10) / 10.0);
   jsonDoc["batteryVolts"] = float(round(currentBatteryVolts * 100) / 100.0);
   jsonDoc["battery"] = currentBatteryPercent;
+  // WiFi link quality, so the dashboard can show reception per room.
+  long rssi = WiFi.RSSI();
+  jsonDoc["rssi"] = rssi;
+  jsonDoc["wifiPercent"] = rssiToPercent(rssi);
 
   String jsonData;
   serializeJson(jsonDoc, jsonData);
