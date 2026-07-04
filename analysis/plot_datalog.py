@@ -19,12 +19,18 @@ Air-quality channels (IAQ / CO2 / VOC) are masked out where the BSEC accuracy
 (`iaq_acc`) is below --min-accuracy, so the warm-up period doesn't draw
 misleading flat lines.
 
+Gaps: the node logs one row per minute, so any jump between consecutive rows
+much larger than that means the node was off (or the SD was out). A NaN row is
+inserted at each such jump (> --gap-min minutes) so matplotlib breaks the line
+instead of drawing a false straight segment across the downtime.
+
 Usage:
     pip install pandas matplotlib
     python plot_datalog.py datalog.csv                 # plot a local file
     python plot_datalog.py --ip 192.168.0.65           # fetch from the board
     python plot_datalog.py datalog.csv -o trends.png    # save instead of show
     python plot_datalog.py datalog.csv --min-accuracy 3 # stricter AQ filter
+    python plot_datalog.py datalog.csv --last 48        # last 48 hours only
 """
 
 import argparse
@@ -99,6 +105,26 @@ def reconstruct_time(df: pd.DataFrame) -> pd.DataFrame:
     return df.sort_values("time").reset_index(drop=True)
 
 
+def insert_gaps(df: pd.DataFrame, gap_min: float) -> pd.DataFrame:
+    """Insert an all-NaN row wherever consecutive samples are > gap_min apart.
+
+    matplotlib connects consecutive points unconditionally, so without this a
+    night with the node unplugged renders as one long diagonal line. A NaN
+    breaks the line at the gap instead.
+    """
+    gaps = df["time"].diff().dt.total_seconds() > gap_min * 60
+    n_gaps = int(gaps.sum())
+    if n_gaps == 0:
+        return df
+    filler = df.loc[gaps, ["time"]].copy()
+    filler["time"] -= pd.Timedelta(seconds=1)   # sits just before the gap's end
+    out = (pd.concat([df, filler])
+             .sort_values("time")
+             .reset_index(drop=True))
+    print(f"[info] {n_gaps} gap(s) longer than {gap_min:g} min -> line breaks inserted.")
+    return out
+
+
 def mask_air_quality(df: pd.DataFrame, min_acc: int) -> pd.DataFrame:
     """Blank IAQ/CO2/VOC where BSEC accuracy is below the threshold."""
     ok = df["iaq_acc"] >= min_acc
@@ -167,6 +193,10 @@ def main():
     p.add_argument("-o", "--out", help="save PNG to this path instead of showing a window")
     p.add_argument("--min-accuracy", type=int, default=1,
                    help="hide IAQ/CO2/VOC below this BSEC accuracy (0-3, default 1; use 3 for strict)")
+    p.add_argument("--gap-min", type=float, default=5.0,
+                   help="break plot lines at gaps longer than this many minutes (default 5)")
+    p.add_argument("--last", type=float, metavar="HOURS",
+                   help="only plot the last N hours of data")
     args = p.parse_args()
 
     if not args.csv and not args.ip:
@@ -178,7 +208,15 @@ def main():
     df = load_csv(source, is_url=bool(args.ip))
     print(f"[info] loaded {len(df)} rows across {df['boot_id'].nunique()} boot session(s).")
     df = reconstruct_time(df)
+    if args.last:
+        cutoff = df["time"].iloc[-1] - pd.Timedelta(hours=args.last)
+        before = len(df)
+        df = df[df["time"] >= cutoff].reset_index(drop=True)
+        print(f"[info] --last {args.last:g}h keeps {len(df)}/{before} rows.")
+        if df.empty:
+            sys.exit("[error] No rows inside the --last window.")
     df = mask_air_quality(df, args.min_accuracy)
+    df = insert_gaps(df, args.gap_min)
     span = df["time"].iloc[-1] - df["time"].iloc[0]
     print(f"[info] {len(df)} plottable rows, {df['time'].iloc[0]} -> "
           f"{df['time'].iloc[-1]} (span {span}).")

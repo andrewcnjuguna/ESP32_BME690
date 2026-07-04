@@ -802,6 +802,10 @@ void sendSensorDataToServer() {
   jsonDoc["soundDb"] = float(round(currentSoundDb * 10) / 10.0);
   jsonDoc["batteryVolts"] = float(round(currentBatteryVolts * 100) / 100.0);
   jsonDoc["battery"] = currentBatteryPercent;
+  // WiFi link quality, so the dashboard can show reception per room.
+  long rssi = WiFi.RSSI();
+  jsonDoc["rssi"] = rssi;
+  jsonDoc["wifiPercent"] = rssiToPercent(rssi);
 
   String jsonData;
   serializeJson(jsonDoc, jsonData);
