@@ -59,6 +59,11 @@ log.
 The node's IP is printed on the serial console at boot
 (`[INFO] Web UI at http://...`).
 
+WiFi is self-healing: if the router is down at boot (or the link drops
+later), the node keeps logging to SD and retries the connection every 30 s
+in the background; OTA and the web page start automatically as soon as the
+first connection succeeds — no reboot needed.
+
 ### Data upload
 
 Every 3 s BSEC cycle the node POSTs a JSON snapshot to `SERVER_URL`
